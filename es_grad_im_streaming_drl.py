@@ -41,6 +41,33 @@ if USE_CUDA:
 else:
     FloatTensor = torch.FloatTensor
 
+def warm_up(agent, env, noise=None, render=False, entropy_coeff=None, overshooting_info=None, trials=3, debug=False):
+    """
+    Computes the score of an actor on a given number of runs,
+    fills the memory if needed
+    """
+
+    returns, term_time_steps = [], []
+    steps = 0
+    s, _ = deepcopy(env.reset())
+    for i in range(args.warm_up_steps):
+        # get next action and act
+        a = agent.sample_action(s)
+        s_prime, r, terminated, truncated, info = env.step(a)
+        agent.update_params(s, a, r, s_prime,  terminated or truncated, entropy_coeff, overshooting_info)
+        s = s_prime
+        if terminated or truncated:
+            if debug:
+                print("Episodic Return: {}, Time Step {}".format(info['episode']['r'][0], steps))
+            returns.append(info['episode']['r'][0])
+            terminated, truncated = False, False
+            s, _ = env.reset()
+        steps += 1
+
+    # returns.append(info['episode']['r'][0])
+    # 10% of latest returns
+    lastest_return = returns[-int(len(returns) * 0.1):]
+    return np.mean(lastest_return), steps
 
 def evaluate(agent, env, noise=None, render=False, entropy_coeff=None, overshooting_info=None, trials=3, debug=False):
     """
@@ -50,48 +77,53 @@ def evaluate(agent, env, noise=None, render=False, entropy_coeff=None, overshoot
 
     returns, term_time_steps = [], []
     steps = 0
-    
+    s, _ = deepcopy(env.reset())
     while trials: 
-        score = 0
-        s, _ = deepcopy(env.reset())
-        terminated = False
-        while not terminated:    
+        # score = 0
+        for i in range(1000):
             # get next action and act
             a = agent.sample_action(s)
             s_prime, r, terminated, truncated, info = env.step(a)
-            score += r
             agent.update_params(s, a, r, s_prime,  terminated or truncated, entropy_coeff, overshooting_info)
             s = s_prime
             
             if terminated or truncated:
                 if debug:
-                    print("Episodic Return: {}, Time Step {}".format(info['episode']['r'][0], t))
+                    print("Episodic Return: {}, Time Step {}".format(info['episode']['r'][0], steps))
                 returns.append(info['episode']['r'][0])
                 terminated, truncated = False, False
                 s, _ = env.reset()
             steps += 1
-
-        returns.append(score)
+        # returns.append(info['episode']['r'][0])
         trials -= 1
 
-    return np.mean(returns), steps
-
+    lastest_return = returns[-int(len(returns) * 0.1):]
+    return np.mean(lastest_return), steps
 
 def initialize_weights(m):
     if isinstance(m, nn.Linear):
         sparse_init(m.weight, sparsity=0.9)
         m.bias.data.fill_(0.0)
 
+def orthogonal_init(scale: float = torch.sqrt(torch.tensor(2.0))):
+    def initializer(tensor):
+        if tensor.ndimension() < 2:
+            raise ValueError("Only tensors with 2 or more dimensions are supported.")
+        nn.init.orthogonal_(tensor, gain=scale)
+    return initializer
+
 class Actor(RLNN):
-    def __init__(self, n_obs=11, n_actions=3, hidden_size=128):
+    def __init__(self, args, n_obs=11, n_actions=3, hidden_size=128):
         super(Actor, self).__init__()
         self.fc_layer   = nn.Linear(n_obs, hidden_size)
         self.hidden_layer = nn.Linear(hidden_size, hidden_size)
         self.linear_mu = nn.Linear(hidden_size, n_actions)
         self.linear_std = nn.Linear(hidden_size, n_actions)
         self.apply(initialize_weights)
+        self.to(args.device)
 
     def forward(self, x):
+        x.to(args.device)
         x = self.fc_layer(x)
         x = F.layer_norm(x, x.size())
         x = F.leaky_relu(x)
@@ -104,14 +136,16 @@ class Actor(RLNN):
         return mu, std
 
 class Critic(RLNN):
-    def __init__(self, n_obs=11, hidden_size=128):
+    def __init__(self, args, n_obs=11, hidden_size=256):
         super(Critic, self).__init__()
         self.fc_layer   = nn.Linear(n_obs, hidden_size)
         self.hidden_layer  = nn.Linear(hidden_size, hidden_size)
         self.linear_layer  = nn.Linear(hidden_size, 1)
         self.apply(initialize_weights)
-
+        self.to(args.device)
+    
     def forward(self, x):
+        x.to(args.device)
         x = self.fc_layer(x)
         x = F.layer_norm(x, x.size())
         x = F.leaky_relu(x)
@@ -121,14 +155,14 @@ class Critic(RLNN):
         return self.linear_layer(x)
 
 class StreamAC(RLNN):
-    def __init__(self, n_obs=11, n_actions=3, hidden_size=128, lr=1.0, gamma=0.99, lamda=0.8, kappa_policy=3.0, kappa_value=2.0):
+    def __init__(self, args, n_obs=11, n_actions=3, hidden_size=128, lr=1.0, gamma=0.99, lamda=0.8, kappa_policy=3.0, kappa_value=2.0):
         super(StreamAC, self).__init__()
         self.gamma = gamma
-        self.actor = Actor(n_obs=n_obs, n_actions=n_actions, hidden_size=hidden_size)
-        self.critic = Critic(n_obs=n_obs, hidden_size=hidden_size)
+        self.actor = Actor(args=args, n_obs=n_obs, n_actions=n_actions, hidden_size=hidden_size)
+        self.critic = Critic(args=args, n_obs=n_obs, hidden_size=hidden_size)
         self.optimizer_policy = Optimizer(self.actor.parameters(), lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_policy)
         self.optimizer_value = Optimizer(self.critic.parameters(), lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_value)
-
+        self.to(args.device)
     def pi(self, x):
         return self.actor(x)
 
@@ -136,10 +170,10 @@ class StreamAC(RLNN):
         return self.critic(x)
 
     def sample_action(self, s):
-        x = torch.from_numpy(s).float()
+        x = torch.from_numpy(s).float().to(args.device)
         mu, std = self.pi(x)
         dist = Normal(mu, std)
-        return dist.sample().numpy()
+        return dist.sample().cpu().numpy()
 
     def update_params(self, s, a, r, s_prime, done, entropy_coeff, overshooting_info=False):
         done_mask = 0 if done else 1
@@ -147,6 +181,7 @@ class StreamAC(RLNN):
                                          torch.tensor(np.array(r)), torch.tensor(np.array(s_prime), dtype=torch.float), \
                                          torch.tensor(np.array(done_mask), dtype=torch.float)
 
+        s, a, r, s_prime, done_mask = s.to(args.device), a.to(args.device), r.to(args.device), s_prime.to(args.device), done_mask.to(args.device)
         v_s, v_prime = self.v(s), self.v(s_prime)
         td_target = r + self.gamma * v_prime * done_mask
         delta = td_target - v_s
@@ -179,10 +214,10 @@ if __name__ == "__main__":
     parser.add_argument('--mode', default='train', type=str,)
     parser.add_argument('--env', default='HalfCheetah-v2', type=str)
     parser.add_argument('--start_steps', default=10000, type=int)
-
+    parser.add_argument('--warm_up_steps', default=10000, type=int)
     # DDPG parameters
-    parser.add_argument('--actor_lr', default=0.001, type=float)
-    parser.add_argument('--critic_lr', default=0.001, type=float)
+    parser.add_argument('--actor_lr', default=1.0, type=float)
+    parser.add_argument('--critic_lr', default=1.0, type=float)
     parser.add_argument('--batch_size', default=100, type=int)
     parser.add_argument('--discount', default=0.99, type=float)
     parser.add_argument('--reward_scale', default=1., type=float)
@@ -244,7 +279,9 @@ if __name__ == "__main__":
     parser.add_argument('--debug', dest='debug', action='store_true')
     parser.add_argument('--seed', default=-1, type=int)
     parser.add_argument('--render', dest='render', action='store_true')
-
+    parser.add_argument('--device', default='cuda', type=str)   
+    parser.add_argument('--trials', default=1, type=int)
+    parser.add_argument('--over_shooting', dest='over_shooting', action='store_true')
     args = parser.parse_args()
     # args.output = get_output_folder(args.output, args.env)
     # with open(args.output + "/parameters.txt", 'w') as file:
@@ -265,12 +302,14 @@ if __name__ == "__main__":
     action_dim = env.action_space.shape[0]
     max_action = int(env.action_space.high[0])
 
-    agent = StreamAC(n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa_policy=args.kappa_policy, kappa_value=args.kappa_value)
+    agent = StreamAC(args=args, n_obs=env.observation_space.shape[0], n_actions=env.action_space.shape[0], lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa_policy=args.kappa_policy, kappa_value=args.kappa_value)
+    # f, steps = warm_up(agent, env, trials=args.trials, entropy_coeff=args.entropy_coeff, debug=args.debug, overshooting_info=args.over_shooting)
+    # prLightPurple('Actor {}, fitness:{}'.format(steps, f))
     a_noise = GaussianNoise(action_dim, sigma=args.gauss_sigma)
     entropy_coeff = args.entropy_coeff
 
-    if USE_CUDA:
-        agent.cuda()
+    # if USE_CUDA:
+    #     agent.cuda()
 
     # CEM
     es = sepCEM(agent.actor.get_size(), mu_init=agent.actor.get_params(), sigma_init=args.sigma_init, damp=args.damp, damp_limit=args.damp_limit,
@@ -297,25 +336,39 @@ if __name__ == "__main__":
     old_n_steps = []
     old_n_start = []
 
+    warm_up_b = False
+    
     while total_steps < args.max_steps:
-
-        fitness = np.zeros(args.pop_size)
-        n_start = np.zeros(args.pop_size)
-        n_steps = np.zeros(args.pop_size)
-        es_params, n_r, idx_r = sampler.ask(args.pop_size, old_es_params)
-        print("Reused {} samples".format(n_r))
-
+        
+        if total_steps == 0:
+            fitness = np.zeros(args.pop_size)
+            n_start = np.zeros(args.pop_size)
+            n_steps = np.zeros(args.pop_size)
+            es_params, n_r, idx_r = sampler.ask(args.pop_size, old_es_params)
+            print("Reused {} samples".format(n_r))
+        
         actor_steps = 0
         reused_steps = 0
 
         # evaluate noisy actor(s)
-        for i in range(args.n_noisy):
-            agent.actor.set_params(es_params[i])
-            agent.optimizer_policy = Optimizer(agent.actor.parameters(), lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa=args.kappa_policy)
-            f, steps = evaluate(agent, env, trials=1, entropy_coeff=entropy_coeff)
-            actor_steps += steps
-            prCyan('Noisy actor {} fitness:{}'.format(i, f))
+        # for i in range(args.n_noisy):
+        #     agent.actor.set_params(es_params[i])
+        #     agent.optimizer_policy = Optimizer(agent.actor.parameters(), lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa=args.kappa_policy)
+        #     f, steps = evaluate(agent, env, trials=args.trials, entropy_coeff=entropy_coeff)
+        #     actor_steps += steps
+        #     prCyan('Noisy actor {} fitness:{}'.format(i, f))
 
+        if not warm_up_b:
+            prBlack('========[Warm Up]=========')
+            # Warm up half of population
+            for i in range(args.pop_size // 2):
+                agent.actor.set_params(es_params[i])
+                agent.optimizer_policy = Optimizer(agent.actor.parameters(), lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa=args.kappa_policy)
+                f, steps = warm_up(agent, env, trials=args.trials, entropy_coeff=entropy_coeff, debug=args.debug, overshooting_info=args.over_shooting)
+                prLightPurple('Actor {}, fitness:{}'.format(i, f))
+            warm_up_b = True
+            prBlack('========[Warm Up Done]=========')
+        
         # evaluate all actors
         for i in range(args.pop_size):
 
@@ -323,7 +376,8 @@ if __name__ == "__main__":
             if i < args.n_grad or (i >= args.n_grad and (i - args.n_grad) >= n_r):
 
                 agent.actor.set_params(es_params[i])
-                f, steps = evaluate(agent, env, trials=1, entropy_coeff=entropy_coeff)
+                agent.optimizer_policy = Optimizer(agent.actor.parameters(), lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa=args.kappa_policy)
+                f, steps = evaluate(agent, env, trials=args.trials, entropy_coeff=entropy_coeff,overshooting_info=args.over_shooting, debug=args.debug)
                 actor_steps += steps
 
                 # updating arrays
@@ -365,7 +419,7 @@ if __name__ == "__main__":
             # evaluate mean actor over several runs. Memory is not filled
             # and steps are not counted
             agent.actor.set_params(es.mu)
-            f_mu, _ = evaluate(agent.actor, env, trials=1, entropy_coeff=entropy_coeff)
+            f_mu, _ = evaluate(agent, env, trials=args.trials, entropy_coeff=entropy_coeff, overshooting_info=args.over_shooting, debug=args.debug)
             prRed('Actor Mu Average Fitness:{}'.format(f_mu))
 
             df.to_pickle(args.output + "/log.pkl")
@@ -390,7 +444,7 @@ if __name__ == "__main__":
                 agent.critic.save_model(args.output, "critic")
                 agent.actor.set_params(es.mu)
                 agent.actor.save_model(args.output, "actor")
-            df = df.append(res, ignore_index=True)
+            df = pd.concat([df, pd.DataFrame(res, index=[0])])
             step_cpt = 0
             print(res)
 
