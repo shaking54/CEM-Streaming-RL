@@ -340,12 +340,11 @@ if __name__ == "__main__":
     
     while total_steps < args.max_steps:
         
-        if total_steps == 0:
-            fitness = np.zeros(args.pop_size)
-            n_start = np.zeros(args.pop_size)
-            n_steps = np.zeros(args.pop_size)
-            es_params, n_r, idx_r = sampler.ask(args.pop_size, old_es_params)
-            print("Reused {} samples".format(n_r))
+        fitness = np.zeros(args.pop_size)
+        n_start = np.zeros(args.pop_size)
+        n_steps = np.zeros(args.pop_size)
+        es_params, n_r, idx_r = sampler.ask(args.pop_size, old_es_params)
+        print("Reused {} samples".format(n_r))
         
         actor_steps = 0
         reused_steps = 0
@@ -361,11 +360,13 @@ if __name__ == "__main__":
         if not warm_up_b:
             prBlack('========[Warm Up]=========')
             # Warm up half of population
-            for i in range(args.pop_size // 2):
+            for i in range(args.pop_size):
                 agent.actor.set_params(es_params[i])
                 agent.optimizer_policy = Optimizer(agent.actor.parameters(), lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa=args.kappa_policy)
                 f, steps = warm_up(agent, env, trials=args.trials, entropy_coeff=entropy_coeff, debug=args.debug, overshooting_info=args.over_shooting)
+                es_params[i] = agent.actor.get_params()
                 prLightPurple('Actor {}, fitness:{}'.format(i, f))
+
             warm_up_b = True
             prBlack('========[Warm Up Done]=========')
         
@@ -379,7 +380,8 @@ if __name__ == "__main__":
                 agent.optimizer_policy = Optimizer(agent.actor.parameters(), lr=args.actor_lr, gamma=args.gamma, lamda=args.lamda, kappa=args.kappa_policy)
                 f, steps = evaluate(agent, env, trials=args.trials, entropy_coeff=entropy_coeff,overshooting_info=args.over_shooting, debug=args.debug)
                 actor_steps += steps
-
+                es_params[i] = agent.actor.get_params()
+                
                 # updating arrays
                 fitness[i] = f
                 n_steps[i] = steps
